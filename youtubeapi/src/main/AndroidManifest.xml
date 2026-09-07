@@ -7,6 +7,6 @@
 
     <!-- NOTE: use older api -->
     <uses-sdk tools:overrideLibrary="
-        com.squareup.quickjs,
+        com.quickjs,
         androidx.webkit"/>
 </manifest>

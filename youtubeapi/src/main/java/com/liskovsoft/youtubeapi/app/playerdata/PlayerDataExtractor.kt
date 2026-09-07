@@ -1,6 +1,6 @@
 package com.liskovsoft.youtubeapi.app.playerdata
 
-import com.eclipsesource.v8.V8ScriptExecutionException
+import com.quickjs.QuickJSException
 import com.liskovsoft.googlecommon.common.helpers.YouTubeHelper
 import com.liskovsoft.sharedutils.helpers.Helpers
 import com.liskovsoft.youtubeapi.app.nsigsolver.common.YouTubeInfoExtractor
@@ -160,7 +160,7 @@ internal class PlayerDataExtractor(val playerUrl: String) {
                 val result = createClientPlaybackNonce()
                 if (result == null)
                     cpnCode = null
-            } catch (error: V8ScriptExecutionException) {
+            } catch (error: QuickJSException) {
                 cpnCode = null
             }
         }

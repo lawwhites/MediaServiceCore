@@ -1,79 +1,105 @@
 package com.liskovsoft.youtubeapi.app.potokennp2.misc
 
-import com.eclipsesource.v8.JavaVoidCallback
-import com.eclipsesource.v8.V8
-import com.eclipsesource.v8.V8ScriptExecutionException
-import com.liskovsoft.youtubeapi.app.nsigsolver.common.withLock
+import com.quickjs.JSContext
+import com.quickjs.JavaCallback
+import com.quickjs.JavaVoidCallback
+import com.quickjs.QuickJS
+import com.quickjs.QuickJSException
 import com.liskovsoft.youtubeapi.app.potokennp2.core.V8WrapperException
+
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
 
 internal class V8Wrapper {
     private val tag = V8Wrapper::class.simpleName
-    private var v8Runtime: V8? = null
-    private val v8Lock = Any()
+    private var quickJS: QuickJS? = null
+    private var jsContext: JSContext? = null
 
-    fun executeStringScript(stdin: String): String {
-        synchronized(v8Lock) {
-            return executeInternal {
-                it.executeStringScript(stdin) ?: throw V8WrapperException("V8 runtime error: empty response")
-            }
+    // NOTE: the QuickJS binding enforces thread affinity (all native calls must
+    // happen on the thread that created the runtime), so pin everything to one
+    // dedicated worker thread. Java callbacks fire re-entrantly on that same
+    // thread, so they must run inline instead of being re-submitted (deadlock).
+    private var jsWorkerThread: Thread? = null
+    private val jsExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "QuickJSPoToken").also { jsWorkerThread = it }
+    }
+
+    private fun <T> onJsThread(block: () -> T): T {
+        if (Thread.currentThread() === jsWorkerThread)
+            return block()
+        try {
+            return jsExecutor.submit(Callable { block() }).get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw V8WrapperException("QuickJS interrupted", e)
         }
     }
 
-    fun executeVoidScript(stdin: String) {
-        synchronized(v8Lock) {
-            executeInternal {
-                it.executeVoidScript(stdin)
-            }
+    fun executeStringScript(stdin: String): String = onJsThread {
+        executeInternal {
+            it.executeStringScript(stdin, "eval.js") ?: throw V8WrapperException("QuickJS runtime error: empty response")
         }
     }
 
-    private fun <T> executeInternal(block: (V8) -> T): T {
+    fun executeVoidScript(stdin: String) = onJsThread {
+        executeInternal {
+            it.executeVoidScript(stdin, "eval.js")
+        }
+    }
+
+    private fun <T> executeInternal(block: (JSContext) -> T): T {
         initRuntime()
 
-        val runtime = v8Runtime ?: throw V8WrapperException("V8 runtime not initialized yet")
+        val runtime = jsContext ?: throw V8WrapperException("QuickJS runtime not initialized yet")
 
         try {
-            return runtime.withLock {
-                block(it)
-            }
-        } catch (e: V8ScriptExecutionException) {
-            throw V8WrapperException("V8 runtime error: ${e.message}", e)
+            return block(runtime)
+        } catch (e: QuickJSException) {
+            throw V8WrapperException("QuickJS runtime error: ${e.message}", e)
         }
     }
 
     private fun initRuntime() {
-        if (v8Runtime != null)
+        if (jsContext != null)
             return
-        v8Runtime = V8.createV8Runtime()
+        val runtime = QuickJS.createRuntime()
+        val context = runtime.createContext()
+        quickJS = runtime
+        jsContext = context
     }
 
-    fun shutdownRuntime() {
-        synchronized(v8Lock) {
-            disposeRuntime()
-        }
+    fun shutdownRuntime() = onJsThread {
+        disposeRuntime()
     }
 
     private fun disposeRuntime() {
-        val runtime = v8Runtime ?: return
-
-        // NOTE: getting lock fixes "Invalid V8 thread access: the locker has been released!"
-        runtime.withLock {
-            it.release(false)
+        try {
+            jsContext?.close()
+        } catch (_: Exception) {
         }
-        v8Runtime = null
+        try {
+            quickJS?.close()
+        } catch (_: Exception) {
+        }
+        jsContext = null
+        quickJS = null
     }
 
-    fun registerJavaMethod(callback: JavaVoidCallback, jsFunctionName: String) {
-        synchronized(v8Lock) {
-            initRuntime()
-            v8Runtime?.registerJavaMethod(callback, jsFunctionName)
-        }
+    fun registerJavaMethod(callback: JavaVoidCallback, jsFunctionName: String) = onJsThread {
+        initRuntime()
+        jsContext?.registerJavaMethod(callback, jsFunctionName)
     }
 
-    fun executeJsFunction(fnName: String): Any? {
-        synchronized(v8Lock) {
-            initRuntime()
-            return v8Runtime?.executeJSFunction(fnName)
-        }
+    fun registerJavaMethod(callback: JavaCallback, jsFunctionName: String) = onJsThread {
+        initRuntime()
+        jsContext?.registerJavaMethod(callback, jsFunctionName)
+    }
+
+    fun executeJsFunction(fnName: String): Any? = onJsThread {
+        initRuntime()
+        jsContext?.executeFunction2(fnName)
     }
 }

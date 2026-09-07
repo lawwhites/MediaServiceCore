@@ -81,18 +81,7 @@ dependencies {
     implementation 'androidx.annotation:annotation:' + annotationXVersion
 
     // js interpreter
-    // duktape fork
-    // implementation 'app.cash.quickjs:quickjs-android:' + quickjsVersion
-    //implementation 'com.squareup.duktape:duktape-android:' + duktapeVersion
-    //implementation 'org.mozilla:rhino:' + rhinoVersion
-    //implementation 'com.eclipsesource.j2v8:j2v8:' + j2v8Version + '@aar'
-    // https://mvnrepository.com/artifact/com.eclipsesource.j2v8/j2v8/6.2.1
-    //implementation(name: 'j2v8-6.2.1', ext: 'aar')
-    //implementation files('libs/j2v8-6.2.1-fixed.aar')
-    // https://stackoverflow.com/questions/60878599/error-building-android-library-direct-local-aar-file-dependencies-are-not-supp
-    stbetaImplementation project(':j2v8')
-    ststableImplementation project(':j2v8')
-    stfdroidImplementation 'com.eclipsesource.j2v8:j2v8:' + j2v8Version + '@aar'
+    implementation project(':quickjs')
 
     // Add kotlin support libs
     implementation 'androidx.core:core-ktx:' + kotlinCoreXVersion

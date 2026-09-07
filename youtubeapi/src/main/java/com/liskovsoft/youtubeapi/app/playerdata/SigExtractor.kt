@@ -1,6 +1,6 @@
 package com.liskovsoft.youtubeapi.app.playerdata
 
-import com.eclipsesource.v8.V8ScriptExecutionException
+import com.quickjs.QuickJSException
 import com.liskovsoft.sharedutils.mylogger.Log
 import com.liskovsoft.googlecommon.common.js.JSInterpret
 import java.util.regex.Pattern
@@ -62,13 +62,14 @@ internal object SigExtractor {
         // Test the function works
         try {
             extractSig(fixedFuncCode, "5cNpZqIJ7ixNqU68Y7S")
-        } catch (error: V8ScriptExecutionException) {
+        } catch (error: QuickJSException) {
             if (nestedCount > 1)
                 return null
 
-            val globalObjNamePattern = Pattern.compile("""([\w$]+) is not defined$""")
+            val globalObjNamePattern = Pattern.compile("""['"]?([\w$]+)['"]?\s+is not defined""")
 
-            val globalObjNameMatcher = globalObjNamePattern.matcher(error.message!!)
+            val msg = error.message ?: ""
+            val globalObjNameMatcher = globalObjNamePattern.matcher(msg)
 
             if (globalObjNameMatcher.find() && globalObjNameMatcher.groupCount() == 1) {
                 val globalObjCode = try {

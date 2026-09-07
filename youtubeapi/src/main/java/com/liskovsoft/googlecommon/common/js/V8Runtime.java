@@ -2,22 +2,28 @@ package com.liskovsoft.googlecommon.common.js;
 
 import androidx.annotation.Nullable;
 
-import com.eclipsesource.v8.V8;
-import com.eclipsesource.v8.V8ResultUndefined;
-import com.eclipsesource.v8.V8ScriptExecutionException;
+import com.quickjs.JSContext;
+import com.quickjs.QuickJS;
+import com.quickjs.QuickJSException;
 import com.liskovsoft.sharedutils.mylogger.Log;
 
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class V8Runtime {
     private static final String TAG = V8Runtime.class.getSimpleName();
     private static V8Runtime sInstance;
-    private V8 mRuntime;
 
-    //static {
-    //    // Fix? J2V8 native library not loaded (j2v8-android-arm_32/j2v8-android-arm_32)
-    //    System.loadLibrary("j2v8");
-    //}
+    // NOTE: the QuickJS binding enforces thread affinity (all native calls must
+    // happen on the thread that created the runtime), so everything runs on one
+    // dedicated worker thread. A single persistent runtime also avoids paying
+    // runtime/context creation on every evaluation.
+    private final ExecutorService mJsThread = Executors.newSingleThreadExecutor(r -> new Thread(r, "QuickJSRuntime"));
+    private QuickJS mQuickJS;
+    private JSContext mContext;
 
     private V8Runtime() {
     }
@@ -31,11 +37,9 @@ public final class V8Runtime {
     }
 
     public static void unhold() {
-        // NOTE: using 'release' produces 'Invalid V8 thread access: the locker has been released!'
-        //if (sInstance != null) {
-        //    sInstance.mRuntime.release();
-        //}
-
+        if (sInstance != null) {
+            sInstance.dispose();
+        }
         sInstance = null;
     }
 
@@ -43,7 +47,7 @@ public final class V8Runtime {
     public String evaluate(final String source) {
         try {
             return evaluateSafe(source);
-        } catch (V8ScriptExecutionException e) {
+        } catch (QuickJSException e) {
             Log.e(TAG, e.getMessage());
             e.printStackTrace();
         }
@@ -52,7 +56,7 @@ public final class V8Runtime {
     }
 
     @Nullable
-    public String evaluateWithErrors(final String source) throws V8ScriptExecutionException {
+    public String evaluateWithErrors(final String source) throws QuickJSException {
         return evaluateSafe(source);
     }
 
@@ -60,7 +64,7 @@ public final class V8Runtime {
     public String evaluate(final List<String> sources) {
         try {
             return evaluateSafe(sources);
-        } catch (V8ScriptExecutionException e) {
+        } catch (QuickJSException e) {
             Log.e(TAG, e.getMessage());
             e.printStackTrace();
         }
@@ -69,72 +73,77 @@ public final class V8Runtime {
     }
 
     @Nullable
-    public String evaluateWithErrors(final List<String> sources) throws V8ScriptExecutionException {
+    public String evaluateWithErrors(final List<String> sources) throws QuickJSException {
         return evaluateSafe(sources);
     }
 
     /**
-     * Not a thread safe. Possible 'Invalid V8 thread access' errors.
+     * Thread safe evaluation on the shared persistent runtime.
      */
-    private String evaluateUnsafe(final String source) throws V8ScriptExecutionException {
-        String result = null;
-
-        try {
-            if (mRuntime == null) {
-                mRuntime = V8.createV8Runtime();
-            }
-            mRuntime.getLocker().acquire(); // Possible 'Invalid V8 thread access' errors
-            result = mRuntime.executeStringScript(source);
-        } finally {
-            if (mRuntime != null) {
-                mRuntime.getLocker().release(); // Possible 'Invalid V8 thread access' errors
-            }
-        }
-
-        return result;
+    private String evaluateSafe(final String source) throws QuickJSException {
+        return onJsThread(() -> getContext().executeStringScript(source, "eval.js"));
     }
 
     /**
-     * Thread safe solution but performance a bit slow.
+     * Thread safe evaluation of multiple scripts sequentially.
      */
-    private String evaluateSafe(final String source) throws V8ScriptExecutionException {
-        V8 runtime = null;
-        String result;
-
-        try {
-            runtime = V8.createV8Runtime();
-            result = runtime.executeStringScript(source);
-        } finally {
-            if (runtime != null) {
-                runtime.release(false);
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Thread safe solution but performance a bit slow.
-     */
-    private String evaluateSafe(final List<String> sources) throws V8ScriptExecutionException {
-        V8 runtime = null;
-        String result = null;
-
-        try {
-            runtime = V8.createV8Runtime();
+    private String evaluateSafe(final List<String> sources) throws QuickJSException {
+        return onJsThread(() -> {
+            String result = null;
             for (String source : sources) {
                 try {
-                    result = runtime.executeStringScript(source);
-                } catch (V8ResultUndefined e) {
-                    // NOP
+                    result = getContext().executeStringScript(source, "eval.js");
+                } catch (QuickJSException e) {
+                    // NOP if intermediate result undefined or not a string
                 }
             }
-        } finally {
-            if (runtime != null) {
-                runtime.release(false);
-            }
-        }
+            return result;
+        });
+    }
 
-        return result;
+    private JSContext getContext() {
+        if (mContext == null) {
+            mQuickJS = QuickJS.createRuntime();
+            mContext = mQuickJS.createContext();
+        }
+        return mContext;
+    }
+
+    private void dispose() {
+        mJsThread.execute(() -> {
+            if (mContext != null) {
+                try {
+                    mContext.close();
+                } catch (Exception ignored) {}
+                mContext = null;
+            }
+            if (mQuickJS != null) {
+                try {
+                    mQuickJS.close();
+                } catch (Exception ignored) {}
+                mQuickJS = null;
+            }
+        });
+    }
+
+    private <T> T onJsThread(Callable<T> block) throws QuickJSException {
+        try {
+            return mJsThread.submit(block).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof QuickJSException) {
+                throw (QuickJSException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
     }
 }

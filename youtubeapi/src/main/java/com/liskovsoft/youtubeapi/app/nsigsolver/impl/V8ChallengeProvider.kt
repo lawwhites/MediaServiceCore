@@ -1,9 +1,9 @@
 package com.liskovsoft.youtubeapi.app.nsigsolver.impl
 
-import com.eclipsesource.v8.V8
-import com.eclipsesource.v8.V8ScriptExecutionException
+import com.quickjs.JSContext
+import com.quickjs.QuickJS
+import com.quickjs.QuickJSException
 import com.liskovsoft.youtubeapi.app.nsigsolver.common.loadScript
-import com.liskovsoft.youtubeapi.app.nsigsolver.common.withLock
 import com.liskovsoft.youtubeapi.app.nsigsolver.provider.JsChallengeProviderError
 import com.liskovsoft.youtubeapi.app.nsigsolver.runtime.JsRuntimeChalBaseJCP
 import com.liskovsoft.youtubeapi.app.nsigsolver.runtime.Script
@@ -11,11 +11,32 @@ import com.liskovsoft.youtubeapi.app.nsigsolver.runtime.ScriptSource
 import com.liskovsoft.youtubeapi.app.nsigsolver.runtime.ScriptType
 import com.liskovsoft.youtubeapi.app.nsigsolver.runtime.ScriptVariant
 
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+
 internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     private val tag = V8ChallengeProvider::class.simpleName
     private val v8NpmLibFilename = listOf("${libPrefix}polyfill.js", "${libPrefix}meriyah-6.1.4.min.js", "${libPrefix}astring-1.9.0.min.js")
-    private var v8Runtime: V8? = null
-    private val v8Lock = Any()
+    private var quickJS: QuickJS? = null
+    private var jsContext: JSContext? = null
+    private val jsLock = Any()
+
+    // NOTE: the QuickJS binding enforces thread affinity (all native calls must
+    // happen on the thread that created the runtime), so pin everything to one
+    // dedicated worker thread instead of whatever pool thread happens to call in.
+    private val jsThread = Executors.newSingleThreadExecutor { r -> Thread(r, "QuickJSSolver") }
+
+    private fun <T> onJsThread(block: () -> T): T {
+        try {
+            return jsThread.submit(Callable { block() }).get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw JsChallengeProviderError("QuickJS interrupted", e)
+        }
+    }
 
     override fun iterScriptSources(): Sequence<Pair<ScriptSource, (ScriptType) -> Script?>> = sequence {
         for ((source, func) in super.iterScriptSources()) {
@@ -28,67 +49,71 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     private fun v8NpmSource(scriptType: ScriptType): Script? {
         if (scriptType != ScriptType.LIB)
             return null
-        // V8-specific lib scripts that uses Deno NPM imports
-        val code = loadScript(v8NpmLibFilename, "Failed to read v8 challenge solver lib script")
+        // QuickJS lib scripts that use Deno NPM imports (meriyah + astring)
+        val code = loadScript(v8NpmLibFilename, "Failed to read challenge solver lib script")
         return Script(scriptType, ScriptVariant.V8_NPM, ScriptSource.BUILTIN, scriptVersion, code)
     }
 
-    override fun runJsRuntime(stdin: String): String {
-        synchronized(v8Lock) {
+    override fun runJsRuntime(stdin: String): String = onJsThread {
+        synchronized(jsLock) {
             initRuntime()
 
-            val result = runV8(stdin)
+            val result = runQuickJs(stdin)
 
             shutdownIfNeeded()
 
-            return result
+            result
         }
     }
 
-    private fun runV8(stdin: String): String {
-        val runtime = v8Runtime ?: throw JsChallengeProviderError("V8 runtime not initialized yet")
+    private fun runQuickJs(stdin: String): String {
+        val context = jsContext ?: throw JsChallengeProviderError("QuickJS runtime not initialized yet")
         try {
-            return runtime.withLock {
-                it.executeStringScript(stdin) ?: throw JsChallengeProviderError("V8 runtime error: empty response")
-            }
-        } catch (e: V8ScriptExecutionException) {
-            if (e.message?.contains("Invalid or unexpected token") ?: false)
+            return context.executeStringScript(stdin, "eval.js") ?: throw JsChallengeProviderError("QuickJS runtime error: empty response")
+        } catch (e: QuickJSException) {
+            if (e.message?.contains("Invalid or unexpected token") == true || e.message?.contains("syntax error") == true)
                 ie.cache.clear(cacheSection) // cached data broken?
-            throw JsChallengeProviderError("V8 runtime error: ${e.message}", e)
+            throw JsChallengeProviderError("QuickJS runtime error: ${e.message}", e)
         }
     }
 
     private fun initRuntime() {
-        if (v8Runtime != null)
+        if (jsContext != null)
             return
-        v8Runtime = V8.createV8Runtime()
-        runV8(constructCommonStdin()) // ignore the result, just warm up
+        val runtime = QuickJS.createRuntime()
+        val context = runtime.createContext()
+        quickJS = runtime
+        jsContext = context
+        runQuickJs(constructCommonStdin()) // warm up with lib and core scripts
     }
 
     private fun disposeRuntime() {
-        val runtime = v8Runtime ?: return
-
-        // NOTE: getting lock fixes "Invalid V8 thread access: the locker has been released!"
-        runtime.withLock {
-            it.release(false)
+        try {
+            jsContext?.close()
+        } catch (_: Exception) {
         }
-        v8Runtime = null
+        try {
+            quickJS?.close()
+        } catch (_: Exception) {
+        }
+        jsContext = null
+        quickJS = null
     }
     
-    fun warmup() {
-        synchronized(v8Lock) {
+    fun warmup() = onJsThread {
+        synchronized(jsLock) {
             initRuntime()
         }
     }
 
-    fun shutdown() {
-        synchronized(v8Lock) {
+    fun shutdown() = onJsThread {
+        synchronized(jsLock) {
             disposeRuntime()
         }
     }
 
-    fun forceRecreate() {
-        synchronized(v8Lock) {
+    fun forceRecreate() = onJsThread {
+        synchronized(jsLock) {
             disposeRuntime()
 
             initRuntime()
@@ -96,8 +121,6 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     }
 
     private fun shutdownIfNeeded() {
-        // NOTE: Possible Invalid thread access if using RxHelper runAsync
-        // NOTE: Shutdown should run on the same thread that created V8 engine.
         disposeRuntime()
     }
 }
