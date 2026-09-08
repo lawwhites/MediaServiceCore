@@ -22,10 +22,12 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     private var jsContext: JSContext? = null
     private val jsLock = Any()
 
-    // NOTE: the QuickJS binding enforces thread affinity (all native calls must
-    // happen on the thread that created the runtime), so pin everything to one
-    // dedicated worker thread instead of whatever pool thread happens to call in.
-    private val jsThread = Executors.newSingleThreadExecutor { r -> Thread(r, "QuickJSSolver") }
+    // 10 minutes idle watchdog to automatically release native resources when inactive
+    private const val IDLE_TIMEOUT_MS = 10 * 60 * 1000L
+    private var idleTask: java.util.concurrent.ScheduledFuture<*>? = null
+
+    // Dedicated single thread executor supporting delayed scheduling for idle watchdog
+    private val jsThread = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "QuickJSSolver") }
 
     private fun <T> onJsThread(block: () -> T): T {
         try {
@@ -56,11 +58,18 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
 
     override fun runJsRuntime(stdin: String): String = onJsThread {
         synchronized(jsLock) {
+            cancelIdleWatchdog()
             initRuntime()
 
-            val result = runQuickJs(stdin)
+            val result = try {
+                runQuickJs(stdin)
+            } catch (e: Exception) {
+                // Self-healing: dispose runtime on error so next call gets a clean state
+                disposeRuntime()
+                throw e
+            }
 
-            shutdownIfNeeded()
+            resetIdleWatchdog()
 
             result
         }
@@ -88,6 +97,7 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     }
 
     private fun disposeRuntime() {
+        cancelIdleWatchdog()
         try {
             jsContext?.close()
         } catch (_: Exception) {
@@ -99,10 +109,28 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
         jsContext = null
         quickJS = null
     }
+
+    private fun cancelIdleWatchdog() {
+        idleTask?.cancel(false)
+        idleTask = null
+    }
+
+    private fun resetIdleWatchdog() {
+        cancelIdleWatchdog()
+        idleTask = jsThread.schedule({
+            synchronized(jsLock) {
+                if (jsContext != null) {
+                    disposeRuntime()
+                }
+            }
+        }, IDLE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
     
     fun warmup() = onJsThread {
         synchronized(jsLock) {
+            cancelIdleWatchdog()
             initRuntime()
+            resetIdleWatchdog()
         }
     }
 
@@ -115,12 +143,10 @@ internal object V8ChallengeProvider: JsRuntimeChalBaseJCP() {
     fun forceRecreate() = onJsThread {
         synchronized(jsLock) {
             disposeRuntime()
-
             initRuntime()
+            resetIdleWatchdog()
         }
     }
 
-    private fun shutdownIfNeeded() {
-        disposeRuntime()
-    }
+    fun isWarm(): Boolean = jsContext != null
 }

@@ -103,24 +103,50 @@ internal class PlayerDataExtractor(val playerUrl: String) {
         var nProcessed: List<String?>? = null
         var sProcessed: List<String?>? = null
 
-        val nRequest = nParams?.takeIf { nFuncCode }?.filterNotNull()?.takeIf { it.isNotEmpty() }?.distinct()?.let {
+        val missingN = if (nFuncCode && nParams != null) {
+            nParams.filterNotNull().distinct().filter { StreamChallengeCache.getNSig(fixedPlayerUrl, it) == null }
+        } else {
+            emptyList()
+        }
+
+        val missingS = if (sFuncCode && sParams != null) {
+            sParams.filterNotNull().distinct().filter { StreamChallengeCache.getSig(fixedPlayerUrl, it) == null }
+        } else {
+            emptyList()
+        }
+
+        val nRequest = missingN.takeIf { it.isNotEmpty() }?.let {
             JsChallengeRequest(JsChallengeType.N, ChallengeInput(fixedPlayerUrl, it))
         }
 
-        val sRequest = sParams?.takeIf { sFuncCode }?.filterNotNull()?.takeIf { it.isNotEmpty() }?.distinct()?.let {
+        val sRequest = missingS.takeIf { it.isNotEmpty() }?.let {
             JsChallengeRequest(JsChallengeType.SIG, ChallengeInput(fixedPlayerUrl, it))
         }
 
-        val result = V8ChallengeProvider.bulkSolve(listOfNotNull(nRequest, sRequest))
-
-        for (item in result) {
-            when (item.response?.type) {
-                JsChallengeType.N ->
-                    nProcessed = nParams?.map { item.response.output.results[it] }
-                JsChallengeType.SIG ->
-                    sProcessed = sParams?.map { item.response.output.results[it] }
-                else -> {}
+        val requests = listOfNotNull(nRequest, sRequest)
+        if (requests.isNotEmpty()) {
+            val result = V8ChallengeProvider.bulkSolve(requests)
+            for (item in result) {
+                when (item.response?.type) {
+                    JsChallengeType.N ->
+                        item.response.output.results.forEach { (k, v) ->
+                            StreamChallengeCache.putNSig(fixedPlayerUrl, k, v)
+                        }
+                    JsChallengeType.SIG ->
+                        item.response.output.results.forEach { (k, v) ->
+                            StreamChallengeCache.putSig(fixedPlayerUrl, k, v)
+                        }
+                    else -> {}
+                }
             }
+        }
+
+        if (nFuncCode && nParams != null) {
+            nProcessed = nParams.map { it?.let { p -> StreamChallengeCache.getNSig(fixedPlayerUrl, p) } }
+        }
+
+        if (sFuncCode && sParams != null) {
+            sProcessed = sParams.map { it?.let { p -> StreamChallengeCache.getSig(fixedPlayerUrl, p) } }
         }
 
         return Pair(nProcessed, sProcessed)
