@@ -2,12 +2,19 @@ package com.liskovsoft.youtubeapi.app.playerdata
 
 import com.quickjs.QuickJSException
 import com.liskovsoft.googlecommon.common.helpers.YouTubeHelper
+import com.liskovsoft.sharedutils.helpers.DeviceHelpers
 import com.liskovsoft.sharedutils.helpers.Helpers
 import com.liskovsoft.youtubeapi.app.nsigsolver.common.YouTubeInfoExtractor
 import com.liskovsoft.youtubeapi.app.nsigsolver.impl.V8ChallengeProvider
+import com.liskovsoft.youtubeapi.app.nsigsolver.impl.WebViewChallengeProvider
 import com.liskovsoft.youtubeapi.app.nsigsolver.provider.ChallengeInput
+import com.liskovsoft.youtubeapi.app.nsigsolver.provider.ChallengeOutput
+import com.liskovsoft.youtubeapi.app.nsigsolver.provider.JsChallengeProviderResponse
 import com.liskovsoft.youtubeapi.app.nsigsolver.provider.JsChallengeRequest
+import com.liskovsoft.youtubeapi.app.nsigsolver.provider.JsChallengeResponse
 import com.liskovsoft.youtubeapi.app.nsigsolver.provider.JsChallengeType
+import com.liskovsoft.youtubeapi.app.nsigsolver.remote.PipePipeNsigDecoder
+import com.liskovsoft.youtubeapi.app.nsigsolver.webview.FunctionNameExtractor
 import com.liskovsoft.youtubeapi.service.internal.MediaServiceData
 
 internal class PlayerDataExtractor(val playerUrl: String) {
@@ -95,6 +102,48 @@ internal class PlayerDataExtractor(val playerUrl: String) {
         return bulkSigExtractReal(null, sParam).second
     }
 
+    private fun solveChallengesCascade(requests: List<JsChallengeRequest>): Sequence<JsChallengeProviderResponse> {
+        // Level 1: Fast WebView V8 Solver (Flow approach)
+        if (DeviceHelpers.isWebViewSupported()) {
+            try {
+                val result = WebViewChallengeProvider.bulkSolve(requests).toList()
+                if (result.isNotEmpty() && result.all { it.error == null }) {
+                    return result.asSequence()
+                }
+            } catch (e: Exception) {
+                // Fall through to Level 2
+            }
+        }
+
+        // Level 2: QuickJS AST Solver (SmartTube existing approach)
+        try {
+            val result = V8ChallengeProvider.bulkSolve(requests).toList()
+            if (result.isNotEmpty() && result.all { it.error == null }) {
+                return result.asSequence()
+            }
+        } catch (e: Exception) {
+            // Fall through to Level 3
+        }
+
+        // Level 3: Remote PipePipe Failover (for N-transform)
+        return sequence {
+            for (req in requests) {
+                if (req.type == JsChallengeType.N) {
+                    try {
+                        val decoded = PipePipeNsigDecoder.decodeBatch(req.input.challenges)
+                        if (decoded.isNotEmpty()) {
+                            yield(JsChallengeProviderResponse(req, JsChallengeResponse(req.type, ChallengeOutput(decoded))))
+                            continue
+                        }
+                    } catch (e: Exception) {
+                        // ignore
+                    }
+                }
+                yield(JsChallengeProviderResponse(req, null, Exception("All challenge solvers failed")))
+            }
+        }
+    }
+
     private fun bulkSigExtractReal(nParams: List<String?>?, sParams: List<String?>?): Pair<List<String?>?, List<String?>?> {
         if (Helpers.allNulls(nParams, sParams)) {
             return Pair(null, null)
@@ -125,7 +174,7 @@ internal class PlayerDataExtractor(val playerUrl: String) {
 
         val requests = listOfNotNull(nRequest, sRequest)
         if (requests.isNotEmpty()) {
-            val result = V8ChallengeProvider.bulkSolve(requests)
+            val result = solveChallengesCascade(requests)
             for (item in result) {
                 when (item.response?.type) {
                     JsChallengeType.N ->
@@ -160,7 +209,10 @@ internal class PlayerDataExtractor(val playerUrl: String) {
         val jsCode = loadPlayer()
 
         cpnCode = jsCode?.let { ClientPlaybackNonceExtractor.extractClientPlaybackNonceCode(it) }
-        signatureTimestamp = jsCode?.let { CommonExtractor.extractSignatureTimestamp(it) }
+        signatureTimestamp = jsCode?.let {
+            CommonExtractor.extractSignatureTimestamp(it)
+                ?: FunctionNameExtractor.extractSignatureTimestamp(it)?.toString()
+        } ?: PipePipeNsigDecoder.getSignatureTimestamp()?.toString()
     }
 
     private fun persistAllData() {
@@ -194,14 +246,18 @@ internal class PlayerDataExtractor(val playerUrl: String) {
 
     private fun checkSigData() {
         if (nFuncCode && sFuncCode) {
-            V8ChallengeProvider.warmup() // enable hot start
+            if (DeviceHelpers.isWebViewSupported()) {
+                WebViewChallengeProvider.warmup(fixedPlayerUrl)
+            } else {
+                V8ChallengeProvider.warmup()
+            }
             return
         }
 
         try {
             val nParam = "5cNpZqIJ7ixNqU68Y7S"
             val sigParam = "NJAJEij0EwRgIhAI0KExTgjfPk-MPM9MAdzyyPRt=BM8-XO5tm5hlMCSVpAiEAv7eP3CURqZNSPow8BXXAoazVoXgeMP7gH9BdylHCwgw=gwzz"
-            val result = V8ChallengeProvider.bulkSolve(
+            val result = solveChallengesCascade(
                 listOf(
                     JsChallengeRequest(JsChallengeType.N, ChallengeInput(fixedPlayerUrl, listOf(nParam))),
                     JsChallengeRequest(JsChallengeType.SIG, ChallengeInput(fixedPlayerUrl, listOf(sigParam))),
